@@ -1,148 +1,91 @@
-#![feature(addr_parse_ascii)]
-
-use actix::{Actor, Addr};
-use actix_web::dev::RequestHead;
-use actix_web::http::header::HeaderMap;
-use actix_web::http::header::HeaderValue;
-use actix_web::http::StatusCode;
-use actix_web::HttpResponseBuilder;
-use actix_web::{
-    dev::ServerHandle,
-    http::{Method, Uri, Version},
-    web, App, Error, HttpRequest, HttpResponse, HttpServer,
-};
-use actix_web_actors::ws;
-use async_std::task;
-use log::info;
-use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
-use std::time::Duration;
-use std::{collections::HashMap, str::FromStr, time::Instant};
 use uuid::Uuid;
+use actix::Addr;
+use actix_web::{dev::ServerHandle, error, web, App, HttpRequest, HttpResponse, HttpServer, Error, http::header::HeaderValue};
+use parking_lot::Mutex;
+
+use tracing::info;
+use tracing_subscriber;
+use awc::Client;
+use url::Url;
 
 mod server;
 mod session;
 
-async fn index(
-    req: HttpRequest,
-    stream: web::Payload,
-    srv: web::Data<Addr<server::StormGrokServer>>,
-) -> Result<HttpResponse, Error> {
-    let id = Uuid::new_v4();
-    let resp = ws::start(
-        session::StormGrokClientSession {
-            id: id,
-            last_heart_beat: Instant::now(),
-            server_address: srv.get_ref().clone(),
-            request_number: 0,
-            responses: HashMap::new(),
-        },
-        &req,
-        stream,
-    );
-    info!("{srv:?}");
-    info!("{:?}", resp);
-    resp
-}
 
 async fn forward(
     req: HttpRequest,
-    body: web::Bytes,
-    srv: web::Data<Addr<server::StormGrokServer>>,
-) -> HttpResponse {
-    let frd = session::FullRequestData {
-        method: req.head().method.to_string(),
-        uri: req.head().uri.to_string(),
-        version: format!("{:?}", req.head().version),
-        headers: req
-            .head()
-            .headers
-            .iter()
-            .map(|(k, v)| (k.as_str().to_owned(), v.as_bytes().to_owned()))
-            .collect::<Vec<_>>(),
-        peer_addr: req.head().peer_addr,
-        body: body.to_vec(),
+    payload: web::Payload,
+    client_addr: String,
+    http_client: web::Data<Client>,
+) -> Result<HttpResponse, Error> {
+    let mut new_url = Url::parse(&format!("http://{client_addr}")).unwrap();
+    new_url.set_path(req.uri().path());
+    new_url.set_query(req.uri().query());
+
+    // TODO: This forwarded implementation is incomplete as it only handles the unofficial
+    // X-Forwarded-For header but not the official Forwarded one.
+    let forwarded_req = http_client
+        .request_from(new_url.as_str(), req.head())
+        .no_decompress();
+    let forwarded_req = match req.head().peer_addr {
+        Some(addr) => forwarded_req.insert_header(("x-forwarded-for", format!("{}", addr.ip()))),
+        None => forwarded_req,
     };
 
-    // Todo: This error handling can probably be improved, lol
-    if let Some(host) = req.headers().get("host") {
-        if let Ok(host) = host.to_str() {
-            if let Some(client_id) = host.split(".").next() {
-                if let Ok(id) = Uuid::parse_str(client_id) {
-                    if let Ok(Some(client_address)) =
-                        srv.send(server::ResolveClient { id: id }).await
-                    {
-                        info!("client_address={client_address:?}");
-                        let response_number = client_address
-                            .send(session::ForwardRequest { request_data: frd })
-                            .await
-                            .unwrap();
-                        info!("Start polling for response {response_number:?}");
+    let res = forwarded_req
+        .send_stream(payload)
+        .await
+        .map_err(error::ErrorInternalServerError)?;
 
-                        // Todo: This polling is disgusting, change it to streamhandling somehow:
-                        // https://actix.rs/actix/actix/trait.StreamHandler.html
-                        for _ in 1..30 {
-                            task::sleep(Duration::from_secs_f64(0.1)).await;
-                            match client_address
-                                .send(session::PollResponse {
-                                    request_number: response_number,
-                                })
-                                .await
-                                .unwrap()
-                            {
-                                Some(e) => {
-                                    let mut r = HttpResponseBuilder::new(
-                                        StatusCode::from_u16(e.status).unwrap(),
-                                    );
-                                    for (k, v) in e.headers.iter() {
-                                        r.append_header((
-                                            k.as_str(),
-                                            HeaderValue::from_bytes(v).unwrap(),
-                                        ));
-                                    }
-                                    return r.body(e.body);
-                                }
-                                None => info!("Polling for response {:?}!", response_number),
-                            }
-                        }
-                        // TODO: This should be a 404 I guess? but actually this shouldn't exist and I need to get the stream thingy
-                        HttpResponse::Ok().body("partyparty")
-                    } else {
-                        HttpResponse::Ok().body(format!("{client_id} is not currently connected"))
-                    }
-                } else {
-                    HttpResponse::NotFound()
-                        .body(format!("{client_id} could not be parsed to client_id"))
-                }
-            } else {
-                HttpResponse::NotFound().body("This is impossibru!!!!")
-            }
+    let mut client_resp = HttpResponse::build(res.status());
+    // Remove `Connection` as per
+    // https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Connection#Directives
+    for (header_name, header_value) in res.headers().iter().filter(|(h, _)| *h != "connection") {
+        client_resp.insert_header((header_name.clone(), header_value.clone()));
+    }
+
+    Ok(client_resp.streaming(res))
+}
+
+async fn resolve_uuid_from_host(host: &HeaderValue, srv: web::Data<Addr<server::StormGrokServer>>) -> Option<String> {
+    let host = host.to_str().ok()?;
+    let client_id = host.split(".").next()?;
+    let id = Uuid::parse_str(client_id).ok()?;
+    srv.send(server::ResolveClient { id: id }).await.ok()?
+}
+
+async fn default(
+    req: HttpRequest,
+    payload: web::Payload,
+    http_client: web::Data<Client>,
+    srv: web::Data<Addr<server::StormGrokServer>>,
+) -> Result<HttpResponse, Error>  {
+    info!("\nREQ: {req:?}");
+    // info!("payload: {payload:?}");
+    info!("srv: {srv:?}");
+    if let Some(host) = req.headers().get("host") {
+        if let Some(client_addr) = resolve_uuid_from_host(host, srv).await {
+            forward(req, payload, client_addr, http_client).await
         } else {
-            HttpResponse::NotFound().body("Host was not a valid string")
+            Ok(HttpResponse::NotFound().body("No connected client found\n"))
         }
     } else {
-        HttpResponse::NotFound().body("Host not found")
+        Ok(HttpResponse::BadRequest().body("Your request needs a host header!\n"))
     }
 }
 
 #[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
-
+async fn main() -> Result<(), std::io::Error> {
+    tracing_subscriber::fmt::init();
     let stop_handle = web::Data::new(StopHandle::default());
-    let server_address = server::StormGrokServer {
-        sessions: HashMap::new(),
-        stop_handle: stop_handle.clone(),
-    }
-    .start();
+    let server_address = server::StormGrokServer::start(stop_handle.clone());
 
-    log::info!("starting storm grok server at http://localhost:3000",);
-
+    info!("starting storm grok server at http://localhost:3000",);
     let srv = HttpServer::new(move || {
         App::new()
+            .app_data(web::Data::new(Client::default()))
             .app_data(web::Data::new(server_address.clone()))
-            .route("/ws/", web::get().to(index))
-            .default_service(web::route().to(forward))
+            .default_service(web::route().to(default))
     })
     .bind(("127.0.0.1", 3000))?
     .run();
