@@ -21,3 +21,5 @@ anyhow = "1.0.65"
 rcgen = "0.9.3"
 uuid = { version = "1.1.2", features = ["v4", "fast-rng"] }
 url = "2.2"
+jsonwebtoken = "8"
+serde = {version = "1.0", features = ["derive"] }

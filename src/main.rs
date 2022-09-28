@@ -1,16 +1,18 @@
-use uuid::Uuid;
 use actix::Addr;
-use actix_web::{dev::ServerHandle, error, web, App, HttpRequest, HttpResponse, HttpServer, Error, http::header::HeaderValue};
+use actix_web::{
+    dev::ServerHandle, error, guard::GuardContext, http::header, http::header::HeaderValue, web,
+    App, Error, HttpMessage, HttpRequest, HttpResponse, HttpServer,
+};
 use parking_lot::Mutex;
+use uuid::Uuid;
 
+use awc::Client;
 use tracing::info;
 use tracing_subscriber;
-use awc::Client;
 use url::Url;
 
 mod server;
 mod session;
-
 
 async fn forward(
     req: HttpRequest,
@@ -47,31 +49,46 @@ async fn forward(
     Ok(client_resp.streaming(res))
 }
 
-async fn resolve_uuid_from_host(host: &HeaderValue, srv: web::Data<Addr<server::StormGrokServer>>) -> Option<String> {
-    let host = host.to_str().ok()?;
-    let client_id = host.split(".").next()?;
-    let id = Uuid::parse_str(client_id).ok()?;
-    srv.send(server::ResolveClient { id: id }).await.ok()?
-}
-
-async fn default(
+async fn uuid_forwarder(
     req: HttpRequest,
     payload: web::Payload,
     http_client: web::Data<Client>,
     srv: web::Data<Addr<server::StormGrokServer>>,
-) -> Result<HttpResponse, Error>  {
-    info!("\nREQ: {req:?}");
-    // info!("payload: {payload:?}");
-    info!("srv: {srv:?}");
-    if let Some(host) = req.headers().get("host") {
-        if let Some(client_addr) = resolve_uuid_from_host(host, srv).await {
-            forward(req, payload, client_addr, http_client).await
-        } else {
-            Ok(HttpResponse::NotFound().body("No connected client found\n"))
-        }
+) -> Result<HttpResponse, Error> {
+    let id = req.extensions().get::<Uuid>().unwrap().clone();
+    if let Some(client_addr) = srv.send(server::ResolveClient { id: id }).await.unwrap() {
+        forward(req, payload, client_addr, http_client).await
     } else {
-        Ok(HttpResponse::BadRequest().body("Your request needs a host header!\n"))
+        Ok(HttpResponse::NotFound().body("No connected client found\n"))
     }
+}
+
+async fn index(_req: HttpRequest, _body: web::Bytes) -> HttpResponse {
+    // info!("\nREQ: {req:?}");
+    // info!("body: {body:?}");
+    HttpResponse::Ok().body("hit index\n")
+}
+
+async fn print_clients_in_log(srv: web::Data<Addr<server::StormGrokServer>>) -> HttpResponse {
+    srv.send(server::LogAllClients {}).await.unwrap();
+    HttpResponse::Ok().body("check your logs!\n")
+}
+
+fn resolve_uuid_from_host(host: &HeaderValue) -> Option<Uuid> {
+    let host = host.to_str().ok()?;
+    let client_id = host.split(".").next()?;
+    let id = Uuid::parse_str(client_id).ok();
+    id
+}
+
+fn uuid_guard(g_ctx: &GuardContext) -> bool {
+    if let Some(host) = g_ctx.head().headers().get(header::HOST) {
+        if let Some(host) = resolve_uuid_from_host(host) {
+            g_ctx.req_data_mut().insert(host);
+            return true;
+        }
+    }
+    false
 }
 
 #[actix_web::main]
@@ -85,7 +102,13 @@ async fn main() -> Result<(), std::io::Error> {
         App::new()
             .app_data(web::Data::new(Client::default()))
             .app_data(web::Data::new(server_address.clone()))
-            .default_service(web::route().to(default))
+            .service(
+                web::resource("{tail:.*}")
+                    .guard(uuid_guard)
+                    .to(uuid_forwarder),
+            )
+            .service(web::resource("/print_clients").to(print_clients_in_log))
+            .service(web::resource("/").to(index))
     })
     .bind(("127.0.0.1", 3000))?
     .run();
