@@ -4,15 +4,17 @@ use actix_web::{
     App, Error, HttpMessage, HttpRequest, HttpResponse, HttpServer,
 };
 use parking_lot::Mutex;
+use rustls::ServerConfig;
 use uuid::Uuid;
 
 use awc::Client;
-use tracing::info;
-use tracing_subscriber;
+use tracing::{debug, info};
+
 use url::Url;
 
 mod server;
 mod session;
+mod settings;
 
 async fn forward(
     req: HttpRequest,
@@ -74,17 +76,25 @@ async fn print_clients_in_log(srv: web::Data<Addr<server::StormGrokServer>>) -> 
     HttpResponse::Ok().body("check your logs!\n")
 }
 
-fn resolve_uuid_from_host(host: &HeaderValue) -> Option<Uuid> {
-    let host = host.to_str().ok()?;
+fn resolve_uuid_from_host(host: &str) -> Option<Uuid> {
     let client_id = host.split(".").next()?;
     let id = Uuid::parse_str(client_id).ok();
     id
 }
 
 fn uuid_guard(g_ctx: &GuardContext) -> bool {
-    if let Some(host) = g_ctx.head().headers().get(header::HOST) {
-        if let Some(host) = resolve_uuid_from_host(host) {
-            g_ctx.req_data_mut().insert(host);
+    if let Some(host_header) = g_ctx.head().headers().get(header::HOST) {
+        if let Ok(host) = host_header.to_str() {
+            if let Some(uuid) = resolve_uuid_from_host(host) {
+                g_ctx.req_data_mut().insert(uuid);
+                return true;
+            }
+        }
+    }
+    debug!("Did not find uuid in host header '{:?}', try to fallback to uri.", g_ctx.head().headers());
+    if let Some(host) = g_ctx.head().uri.host() {
+        if let Some(uuid) = resolve_uuid_from_host(host) {
+            g_ctx.req_data_mut().insert(uuid);
             return true;
         }
     }
@@ -93,11 +103,10 @@ fn uuid_guard(g_ctx: &GuardContext) -> bool {
 
 #[actix_web::main]
 async fn main() -> Result<(), std::io::Error> {
-    tracing_subscriber::fmt::init();
+    let config = settings::Settings::new();
     let stop_handle = web::Data::new(StopHandle::default());
-    let server_address = server::StormGrokServer::start(stop_handle.clone());
+    let server_address = server::StormGrokServer::start(stop_handle.clone(), &config);
 
-    info!("starting storm grok server at http://localhost:3000",);
     let srv = HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(Client::default()))
@@ -109,8 +118,25 @@ async fn main() -> Result<(), std::io::Error> {
             )
             .service(web::resource("/print_clients").to(print_clients_in_log))
             .service(web::resource("/").to(index))
-    })
-    .bind(("127.0.0.1", 3000))?
+    });
+
+    info!(
+        "starting storm grok server at {}:{:?}",
+        config.server.host, config.server.http_port
+    );
+    let srv = if config.env == settings::ENV::Prod {
+        let (certs, key) = config.get_certs_and_key();
+        srv.bind_rustls(
+            (config.server.host, config.server.http_port),
+            ServerConfig::builder()
+                .with_safe_defaults()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .expect("bad certificate/key"),
+        )?
+    } else {
+        srv.bind((config.server.host, config.server.http_port))?
+    }
     .run();
     stop_handle.register(srv.handle());
     srv.await

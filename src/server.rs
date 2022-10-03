@@ -1,14 +1,12 @@
 use actix::{prelude::*, Actor, Addr};
 use actix_web::web;
 use quinn::{Connecting, Endpoint, ServerConfig};
-
-use rcgen;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use std::{collections::HashMap, net::SocketAddr};
 use uuid::Uuid;
 
-use crate::{session, StopHandle};
+use crate::{session, settings, StopHandle};
 
 #[derive(Debug)]
 pub struct StormGrokServer {
@@ -20,18 +18,15 @@ impl Actor for StormGrokServer {
     type Context = Context<Self>;
 }
 
-fn generate_self_signed_cert() -> (rustls::Certificate, rustls::PrivateKey) {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-    let key = rustls::PrivateKey(cert.serialize_private_key_der());
-    (rustls::Certificate(cert.serialize_der().unwrap()), key)
-}
-
 impl StormGrokServer {
-    pub fn start(stop_handle: web::Data<StopHandle>) -> Addr<Self> {
-        let (cert, key) = generate_self_signed_cert();
-        let server_config = ServerConfig::with_single_cert(vec![cert], key).unwrap();
-
-        let server_address = "127.0.0.1:5000".parse::<SocketAddr>().unwrap();
+    pub fn start(stop_handle: web::Data<StopHandle>, config: &settings::Settings) -> Addr<Self> {
+        let (certs, key) = config.get_certs_and_key();
+        let server_config =
+            ServerConfig::with_single_cert(certs, key).expect("bad certificate/key");
+        let server_address = format!("{}:{:?}", config.server.host, config.server.quic_port)
+            .parse::<SocketAddr>()
+            .unwrap();
+        info!("Starting Quic server on {:?}", server_address);
         let (endpoint, incoming) = Endpoint::server(server_config, server_address).unwrap();
 
         StormGrokServer::create(|ctx| {
@@ -91,6 +86,7 @@ pub struct ResolveClient {
 impl Handler<ResolveClient> for StormGrokServer {
     type Result = Option<String>;
     fn handle(&mut self, msg: ResolveClient, _: &mut Context<Self>) -> Self::Result {
+        debug!("Resolving client for {:?}", &msg.id);
         match self.sessions.get(&msg.id) {
             Some(client_address) => Some(client_address.clone().1),
             None => None,
@@ -100,7 +96,7 @@ impl Handler<ResolveClient> for StormGrokServer {
 
 #[derive(Message)]
 #[rtype(result = "()")]
-pub struct LogAllClients { }
+pub struct LogAllClients {}
 impl Handler<LogAllClients> for StormGrokServer {
     type Result = ();
     fn handle(&mut self, _: LogAllClients, _: &mut Context<Self>) -> Self::Result {
@@ -110,5 +106,3 @@ impl Handler<LogAllClients> for StormGrokServer {
         }
     }
 }
-
-
