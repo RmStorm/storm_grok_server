@@ -1,3 +1,2 @@
 [server]
-http_port = "3000"
 quic_port = "5000"

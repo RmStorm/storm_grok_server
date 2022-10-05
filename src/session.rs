@@ -7,7 +7,7 @@ use anyhow::{ensure, Result};
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use std::{io::ErrorKind, time::Duration};
-use tracing::log::{error, info};
+use tracing::log::{error, info, debug};
 use uuid::Uuid;
 
 use crate::server;
@@ -93,9 +93,9 @@ impl Handler<Ping> for StormGrokClientSession {
     }
 }
 
-async fn create_server_for_client(tcp_listener: TcpListener, connection: Connection, id: Uuid) {
-    while let Ok((mut client, _addr)) = tcp_listener.accept().await {
-        info!("Forwarding to client {:?}", id);
+async fn connect_tcp_to_bi_quic(tcp_listener: TcpListener, connection: Connection) {
+    while let Ok((mut client, addr)) = tcp_listener.accept().await {
+        debug!("Created tcp listen port on {:?}", addr);
         let (mut server_send, mut server_recv) = connection.clone().open_bi().await.unwrap();
         tokio::spawn(async move {
             let (mut client_recv, mut client_send) = client.split();
@@ -116,13 +116,15 @@ impl Handler<StartListeningOnPort> for StormGrokClientSession {
     type Result = ();
 
     fn handle(&mut self, msg: StartListeningOnPort, ctx: &mut Self::Context) {
-        create_server_for_client(msg.tcp_listener, self.connection.clone(), self.id.clone())
+        info!("Forwarding to client {:?}", self.id);
+        connect_tcp_to_bi_quic(msg.tcp_listener, self.connection.clone())
             .into_actor(self)
             .spawn(ctx);
     }
 }
 
 async fn listen_available_port() -> TcpListener {
+    debug!("Finding available port");
     for port in 1025..65535 {
         match TcpListener::bind(("127.0.0.1", port)).await {
             Ok(l) => return l,
@@ -164,6 +166,7 @@ async fn do_handshake(
 
     let tcp_listener = listen_available_port().await;
     let tcp_addr = tcp_listener.local_addr().unwrap();
+    debug!("Setting up client session with tcp listener on {:?}", tcp_listener);
 
     let session_address =
         StormGrokClientSession::start(id, tcp_addr.to_string(), new_conn, server_address.clone());

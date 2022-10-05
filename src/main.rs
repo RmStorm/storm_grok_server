@@ -1,6 +1,6 @@
 use actix::Addr;
 use actix_web::{
-    dev::ServerHandle, error, guard::GuardContext, http::header, http::header::HeaderValue, web,
+    dev::ServerHandle, error, guard::GuardContext, http::header, web,
     App, Error, HttpMessage, HttpRequest, HttpResponse, HttpServer,
 };
 use parking_lot::Mutex;
