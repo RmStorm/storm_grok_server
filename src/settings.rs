@@ -27,6 +27,12 @@ pub struct Server {
     pub tls: Option<Tls>,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct AuthRules {
+    pub users: Vec<String>,
+    pub host_domains: Vec<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub enum ENV {
     Dev,
@@ -45,6 +51,7 @@ impl From<&str> for ENV {
 #[derive(Debug, Deserialize, Clone)]
 pub struct Settings {
     pub server: Server,
+    pub auth: AuthRules,
     pub log: Log,
     pub env: ENV,
 }

@@ -13,6 +13,7 @@ pub struct StormGrokServer {
     pub sessions: HashMap<Uuid, (Addr<session::StormGrokClientSession>, String)>,
     pub server_endpoint: Endpoint,
     pub stop_handle: web::Data<StopHandle>,
+    pub auth: settings::AuthRules,
 }
 impl Actor for StormGrokServer {
     type Context = Context<Self>;
@@ -35,6 +36,7 @@ impl StormGrokServer {
                 sessions: HashMap::new(),
                 server_endpoint: endpoint,
                 stop_handle: stop_handle,
+                auth: config.auth.clone(),
             }
         })
     }
@@ -42,7 +44,7 @@ impl StormGrokServer {
 
 impl StreamHandler<Connecting> for StormGrokServer {
     fn handle(&mut self, item: Connecting, ctx: &mut Self::Context) {
-        session::start_session(item, ctx.address())
+        session::start_session(item, ctx.address(), self.auth.clone())
             .into_actor(self)
             .spawn(ctx); // No waiting I think?
     }

@@ -1,7 +1,7 @@
 use actix::Addr;
 use actix_web::{
-    dev::ServerHandle, error, guard::GuardContext, http::header, web,
-    App, Error, HttpMessage, HttpRequest, HttpResponse, HttpServer,
+    dev::ServerHandle, error, guard::GuardContext, http::header, web, App, Error, HttpMessage,
+    HttpRequest, HttpResponse, HttpServer,
 };
 use parking_lot::Mutex;
 use rustls::ServerConfig;
@@ -91,7 +91,10 @@ fn uuid_guard(g_ctx: &GuardContext) -> bool {
             }
         }
     }
-    debug!("Did not find uuid in host header '{:?}', try to fallback to uri.", g_ctx.head().headers());
+    debug!(
+        "Did not find uuid in host header '{:?}', try to fallback to uri.",
+        g_ctx.head().headers()
+    );
     if let Some(host) = g_ctx.head().uri.host() {
         if let Some(uuid) = resolve_uuid_from_host(host) {
             g_ctx.req_data_mut().insert(uuid);
