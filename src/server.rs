@@ -6,7 +6,7 @@ use tracing::{debug, error, info};
 use std::{collections::HashMap, net::SocketAddr};
 use uuid::Uuid;
 
-use crate::{session, settings, StopHandle};
+use crate::{google_key_store, session, settings, StopHandle};
 
 #[derive(Debug)]
 pub struct StormGrokServer {
@@ -14,6 +14,7 @@ pub struct StormGrokServer {
     pub server_endpoint: Endpoint,
     pub stop_handle: web::Data<StopHandle>,
     pub auth: settings::AuthRules,
+    pub gkey_address: Addr<google_key_store::GoogleKeyStore>,
 }
 impl Actor for StormGrokServer {
     type Context = Context<Self>;
@@ -29,6 +30,7 @@ impl StormGrokServer {
             .unwrap();
         info!("Starting Quic server on {:?}", server_address);
         let (endpoint, incoming) = Endpoint::server(server_config, server_address).unwrap();
+        let gkey_address = google_key_store::GoogleKeyStore::start();
 
         StormGrokServer::create(|ctx| {
             ctx.add_stream(incoming);
@@ -37,6 +39,7 @@ impl StormGrokServer {
                 server_endpoint: endpoint,
                 stop_handle: stop_handle,
                 auth: config.auth.clone(),
+                gkey_address: gkey_address,
             }
         })
     }
@@ -44,9 +47,14 @@ impl StormGrokServer {
 
 impl StreamHandler<Connecting> for StormGrokServer {
     fn handle(&mut self, item: Connecting, ctx: &mut Self::Context) {
-        session::start_session(item, ctx.address(), self.auth.clone())
-            .into_actor(self)
-            .spawn(ctx); // No waiting I think?
+        session::start_session(
+            item,
+            ctx.address(),
+            self.gkey_address.clone(),
+            self.auth.clone(),
+        )
+        .into_actor(self)
+        .spawn(ctx); // No waiting I think?
     }
 }
 

@@ -7,11 +7,13 @@ use parking_lot::Mutex;
 use rustls::ServerConfig;
 use uuid::Uuid;
 
+use actix_web::error::ErrorInternalServerError;
 use awc::Client;
 use tracing::{debug, info};
 
 use url::Url;
 
+mod google_key_store;
 mod server;
 mod session;
 mod settings;
@@ -57,7 +59,11 @@ async fn uuid_forwarder(
     http_client: web::Data<Client>,
     srv: web::Data<Addr<server::StormGrokServer>>,
 ) -> Result<HttpResponse, Error> {
-    let id = req.extensions().get::<Uuid>().unwrap().clone();
+    let id = req
+        .extensions()
+        .get::<Uuid>()
+        .ok_or(ErrorInternalServerError("No valid uuid found after guard."))?
+        .clone();
     if let Some(client_addr) = srv.send(server::ResolveClient { id: id }).await.unwrap() {
         forward(req, payload, client_addr, http_client).await
     } else {
