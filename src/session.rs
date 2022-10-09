@@ -13,6 +13,21 @@ use uuid::Uuid;
 
 use crate::{google_key_store, server, settings};
 
+#[derive(Debug, Copy, Clone)]
+enum Mode {
+    Http,
+    Tcp,
+}
+
+impl From<u8> for Mode {
+    fn from(num: u8) -> Self {
+        match num {
+            116 => Mode::Tcp, // 116 = t in ascii
+            _ => Mode::Http,  // default to Http
+        }
+    }
+}
+
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(4);
 
 #[derive(Debug)]
@@ -164,7 +179,8 @@ async fn do_handshake(
 
     if let Some(Ok((mut send, recv))) = new_conn.bi_streams.next().await {
         let received_bytes = recv.read_to_end(1000).await?;
-        let token = String::from_utf8_lossy(&received_bytes);
+        info!("First byte = {:?}", Mode::from(received_bytes[0]));
+        let token = String::from_utf8_lossy(&received_bytes[1..]);
         let kid = decode_header(&token)?
             .kid
             .ok_or(anyhow!("No kid found in token header"))?;
