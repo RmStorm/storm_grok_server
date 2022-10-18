@@ -1,85 +1,69 @@
-use actix::Addr;
-use actix_web::{
-    dev::ServerHandle, error, guard::GuardContext, http::header, web, App, Error, HttpMessage,
-    HttpRequest, HttpResponse, HttpServer,
-};
-use parking_lot::Mutex;
+use axum::body::Body;
+use hyper::client::HttpConnector;
+use hyper_rustls::HttpsConnector;
 use rustls::ServerConfig;
+
+use axum::response::Response;
+
+use axum::http::status::StatusCode;
+use axum::{http::Request, routing::any};
+use axum_server::tls_rustls::RustlsConfig;
+use hyper::Uri;
+use tower::util::ServiceExt;
+
+use axum::Extension;
+use tracing::info;
 use uuid::Uuid;
 
-use actix_web::error::ErrorInternalServerError;
-use awc::Client;
-use tracing::{debug, info};
-
-use url::Url;
+use axum::{extract::Host, Router};
+use jsonwebtoken::DecodingKey;
+use parking_lot::RwLock;
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
 mod google_key_store;
 mod server;
 mod session;
 mod settings;
 
-async fn forward(
-    req: HttpRequest,
-    payload: web::Payload,
-    client_addr: String,
-    http_client: web::Data<Client>,
-) -> Result<HttpResponse, Error> {
-    let mut new_url = Url::parse(&format!("http://{client_addr}")).unwrap();
-    new_url.set_path(req.uri().path());
-    new_url.set_query(req.uri().query());
+type KeyMap = Arc<RwLock<HashMap<String, DecodingKey>>>;
+type ClientMap = Arc<RwLock<HashMap<Uuid, String>>>;
+type HttpClient = hyper::client::Client<HttpConnector, Body>;
+type HttpsClient = hyper::client::Client<HttpsConnector<HttpConnector>, Body>;
 
-    // TODO: This forwarded implementation is incomplete as it only handles the unofficial
-    // X-Forwarded-For header but not the official Forwarded one.
-    let forwarded_req = http_client
-        .request_from(new_url.as_str(), req.head())
-        .no_decompress();
-    let forwarded_req = match req.head().peer_addr {
-        Some(addr) => forwarded_req.insert_header(("x-forwarded-for", format!("{}", addr.ip()))),
-        None => forwarded_req,
+async fn forwarder(
+    Extension(client): Extension<HttpClient>,
+    Extension(client_map): Extension<ClientMap>,
+    host: Host,
+    mut req: Request<Body>,
+) -> Response<Body> {
+    let path_query = req
+        .uri()
+        .path_and_query()
+        .map(|v| v.as_str())
+        .unwrap_or(req.uri().path());
+
+    let uuid = resolve_uuid_from_host(&host.0).unwrap();
+
+    let uri = match client_map.read().get(&uuid) {
+        Some(addr) => format!("http://{}{}", addr, path_query),
+        None => {
+            return Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::from("No active client found\n"))
+                .unwrap();
+        }
     };
 
-    let res = forwarded_req
-        .send_stream(payload)
-        .await
-        .map_err(error::ErrorInternalServerError)?;
-
-    let mut client_resp = HttpResponse::build(res.status());
-    // Remove `Connection` as per
-    // https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Connection#Directives
-    for (header_name, header_value) in res.headers().iter().filter(|(h, _)| *h != "connection") {
-        client_resp.insert_header((header_name.clone(), header_value.clone()));
-    }
-
-    Ok(client_resp.streaming(res))
+    *req.uri_mut() = Uri::try_from(uri).unwrap();
+    client.request(req).await.unwrap()
 }
 
-async fn uuid_forwarder(
-    req: HttpRequest,
-    payload: web::Payload,
-    http_client: web::Data<Client>,
-    srv: web::Data<Addr<server::StormGrokServer>>,
-) -> Result<HttpResponse, Error> {
-    let id = req
-        .extensions()
-        .get::<Uuid>()
-        .ok_or(ErrorInternalServerError("No valid uuid found after guard."))?
-        .clone();
-    if let Some(client_addr) = srv.send(server::ResolveClient { id: id }).await.unwrap() {
-        forward(req, payload, client_addr, http_client).await
-    } else {
-        Ok(HttpResponse::NotFound().body("No connected client found\n"))
-    }
-}
-
-async fn index(_req: HttpRequest, _body: web::Bytes) -> HttpResponse {
-    // info!("\nREQ: {req:?}");
-    // info!("body: {body:?}");
-    HttpResponse::Ok().body("hit index\n")
-}
-
-async fn print_clients_in_log(srv: web::Data<Addr<server::StormGrokServer>>) -> HttpResponse {
-    srv.send(server::LogAllClients {}).await.unwrap();
-    HttpResponse::Ok().body("check your logs!\n")
+async fn handler(Extension(client_map): Extension<ClientMap>, host: Host) -> &'static str {
+    println!("{:?}", host);
+    println!("{:?}", client_map);
+    "Hello, world!\n"
 }
 
 fn resolve_uuid_from_host(host: &str) -> Option<Uuid> {
@@ -88,82 +72,63 @@ fn resolve_uuid_from_host(host: &str) -> Option<Uuid> {
     id
 }
 
-fn uuid_guard(g_ctx: &GuardContext) -> bool {
-    if let Some(host_header) = g_ctx.head().headers().get(header::HOST) {
-        if let Ok(host) = host_header.to_str() {
-            if let Some(uuid) = resolve_uuid_from_host(host) {
-                g_ctx.req_data_mut().insert(uuid);
-                return true;
-            }
-        }
-    }
-    debug!(
-        "Did not find uuid in host header '{:?}', try to fallback to uri.",
-        g_ctx.head().headers()
-    );
-    if let Some(host) = g_ctx.head().uri.host() {
-        if let Some(uuid) = resolve_uuid_from_host(host) {
-            g_ctx.req_data_mut().insert(uuid);
-            return true;
-        }
-    }
-    false
-}
-
-#[actix_web::main]
-async fn main() -> Result<(), std::io::Error> {
+#[tokio::main]
+async fn main() {
     let config = settings::Settings::new();
-    let stop_handle = web::Data::new(StopHandle::default());
-    let server_address = server::StormGrokServer::start(stop_handle.clone(), &config);
+    let key_store: KeyMap = Arc::new(RwLock::new(HashMap::new()));
+    let client_map: ClientMap = Arc::new(RwLock::new(HashMap::new()));
+    let sg_server = server::start_storm_grok_server(&config, client_map.clone(), key_store.clone());
 
-    let srv = HttpServer::new(move || {
-        App::new()
-            .app_data(web::Data::new(Client::default()))
-            .app_data(web::Data::new(server_address.clone()))
-            .service(
-                web::resource("{tail:.*}")
-                    .guard(uuid_guard)
-                    .to(uuid_forwarder),
-            )
-            .service(web::resource("/print_clients").to(print_clients_in_log))
-            .service(web::resource("/").to(index))
-    });
+    let client: HttpClient = hyper::Client::new();
 
-    info!(
-        "starting storm grok server at {}:{:?}",
-        config.server.host, config.server.http_port
-    );
-    let srv = if config.env == settings::ENV::Prod {
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .https_only()
+        .enable_http1()
+        .build();
+    let https_client: HttpsClient = hyper::Client::builder().build(https);
+
+    let forwarder_router = Router::new().route("/*path", any(forwarder));
+    let default_router = Router::new().route("/*path", any(handler));
+
+    let app = Router::new()
+        .route(
+            "/*path",
+            any(|Host(hostname): Host, request: Request<Body>| async move {
+                match resolve_uuid_from_host(hostname.as_str()) {
+                    Some(_uuid) => forwarder_router.oneshot(request).await,
+                    None => default_router.oneshot(request).await,
+                }
+            }),
+        )
+        .layer(Extension(client_map))
+        .layer(Extension(client));
+
+    let addr = format!("{}:{}", config.server.host, config.server.http_port);
+    info!("starting storm grok server at {}", addr);
+    let addr: SocketAddr = addr.parse().unwrap();
+
+    if config.env == settings::ENV::Prod {
         let (certs, key) = config.get_certs_and_key();
-        srv.bind_rustls(
-            (config.server.host, config.server.http_port),
+        let tls_config = RustlsConfig::from_config(Arc::new(
             ServerConfig::builder()
                 .with_safe_defaults()
                 .with_no_client_auth()
                 .with_single_cert(certs, key)
                 .expect("bad certificate/key"),
-        )?
+        ));
+        let http_serve = axum_server::bind_rustls(addr, tls_config).serve(app.into_make_service());
+        tokio::select!(
+            _ = http_serve => {},
+            _ = sg_server => {},
+            _ = google_key_store::refresh_loop(key_store, https_client) => {},
+        );
     } else {
-        srv.bind((config.server.host, config.server.http_port))?
-    }
-    .run();
-    stop_handle.register(srv.handle());
-    srv.await
-}
-
-// This comes from: https://github.com/actix/examples/tree/master/shutdown-server
-#[derive(Debug, Default)]
-pub struct StopHandle {
-    pub inner: Mutex<Option<ServerHandle>>,
-}
-impl StopHandle {
-    /// Sets the server handle to stop.
-    pub(crate) fn register(&self, handle: ServerHandle) {
-        *self.inner.lock() = Some(handle);
-    }
-
-    /// Sends stop signal through contained server handle.
-    pub(crate) fn stop(&self, graceful: bool) {
-        let _ = self.inner.lock().as_ref().unwrap().stop(graceful);
-    }
+        let http_serve = axum_server::bind(addr).serve(app.into_make_service());
+        tokio::select!(
+            _ = http_serve => {},
+            _ = sg_server => {},
+            _ = google_key_store::refresh_loop(key_store, https_client) => {},
+        );
+    };
 }

@@ -1,17 +1,16 @@
-use actix::{prelude::*, Actor, Addr};
-use actix_web::rt::net::TcpListener;
-
 use futures_util::stream::StreamExt;
-use quinn::{Connecting, Connection, NewConnection, OpenUni};
+use quinn::{Connecting, Connection, NewConnection};
+use tokio::net::TcpListener;
 
-use anyhow::{anyhow, bail, Result};
-use jsonwebtoken::{decode, decode_header, Algorithm, Validation};
+use anyhow::{Result, bail, anyhow};
+use jsonwebtoken::{decode_header, decode, Algorithm, Validation};
 use serde::{Deserialize, Serialize};
-use std::{io::ErrorKind, time::Duration};
+use std::io::ErrorKind;
+use tokio::time::{self as time, Duration};
 use tracing::log::{debug, error, info};
 use uuid::Uuid;
 
-use crate::{google_key_store, server, settings};
+use crate::{ClientMap, KeyMap, settings};
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 enum Mode {
@@ -30,93 +29,42 @@ impl From<u8> for Mode {
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(4);
 
+async fn send_ping(connection: Connection) -> Result<()> {
+    let mut interval = time::interval(HEARTBEAT_INTERVAL);
+    loop {
+        interval.tick().await;
+        let mut send = connection.open_uni().await?;
+        send.write_all(b"ping").await?;
+        send.finish().await?;
+    }
+}
+
 #[derive(Debug)]
-pub struct StormGrokClientSession {
-    pub id: Uuid,
-    // pub tcp_listener: TcpListener,
-    pub tcp_addr: String,
-    pub connection: Connection,
-    pub server_address: Addr<server::StormGrokServer>,
+pub struct RegisteredListener {
+    tcp_listener: TcpListener,
+    client_map: ClientMap,
+    id: Uuid,
 }
 
-impl StormGrokClientSession {
-    fn heart_beat(&self, ctx: &mut Context<Self>) {
-        ctx.run_interval(HEARTBEAT_INTERVAL, |_act, ctx| {
-            ctx.address().do_send(Ping {});
+impl Drop for RegisteredListener {
+    fn drop(&mut self) {
+        info!("dropping {:?}", self.tcp_listener);
+        info!("deresigtring from {:?}", self.client_map);
+        self.client_map.write().remove(&self.id);
+    }
+}
+
+async fn connect_tcp_to_bi_quic(listener: RegisteredListener, connection: Connection) {
+    while let Ok((mut client, addr)) = listener.tcp_listener.accept().await {
+        debug!("Created tcp listen port on {:?}", addr);
+        let (mut server_send, mut server_recv) = connection.clone().open_bi().await.unwrap();
+        tokio::spawn(async move {
+            let (mut client_recv, mut client_send) = client.split();
+            tokio::select! {
+                _ = tokio::io::copy(&mut server_recv, &mut client_send) => {}
+                _ = tokio::io::copy(&mut client_recv, &mut server_send) => {}
+            };
         });
-        info!("Started heartbeat");
-    }
-}
-
-impl Actor for StormGrokClientSession {
-    type Context = Context<Self>;
-    fn started(&mut self, ctx: &mut Context<Self>) {
-        self.heart_beat(ctx);
-    }
-
-    fn stopped(&mut self, _ctx: &mut Context<Self>) {
-        self.server_address
-            .do_send(server::Disconnect { id: self.id });
-        info!("Client {:?} is stopped", self.id);
-    }
-}
-
-async fn send_ping(uni_pipe: OpenUni) -> Result<()> {
-    let mut send = uni_pipe.await?;
-    send.write_all(b"ping").await?;
-    send.finish().await?;
-    Ok(())
-}
-
-#[derive(Message, Debug)]
-#[rtype(result = "()")]
-pub struct Ping {}
-impl Handler<Ping> for StormGrokClientSession {
-    type Result = ();
-
-    fn handle(&mut self, _msg: Ping, ctx: &mut Self::Context) {
-        send_ping(self.connection.open_uni())
-            .into_actor(self)
-            .then(|res, _act, ctx| {
-                if let Err(err) = res {
-                    error!("encountered connection error in uni_stream: {:?}", err);
-                    ctx.stop();
-                }
-                fut::ready(())
-            })
-            .spawn(ctx);
-    }
-}
-
-async fn connect_tcp_to_bi_quic(tcp_listener: TcpListener, connection: Connection) {
-    while let Ok((mut client, addr)) = tcp_listener.accept().await {
-        debug!("accepted tcp conn on {:?}", addr);
-        if let Ok((mut server_send, mut server_recv)) = connection.clone().open_bi().await {
-            debug!("accepted quic bi-conn");
-            tokio::spawn(async move {
-                let (mut client_recv, mut client_send) = client.split();
-                debug!("Hooking up tcp conn to quic bi-conn");
-                tokio::select! {
-                    _ = tokio::io::copy(&mut server_recv, &mut client_send) => {}
-                    _ = tokio::io::copy(&mut client_recv, &mut server_send) => {}
-                };
-            });
-        }
-    }
-}
-
-#[derive(Message, Debug)]
-#[rtype(result = "()")]
-pub struct StartListeningOnPort {
-    pub tcp_listener: TcpListener,
-}
-impl Handler<StartListeningOnPort> for StormGrokClientSession {
-    type Result = ();
-    fn handle(&mut self, msg: StartListeningOnPort, ctx: &mut Self::Context) {
-        connect_tcp_to_bi_quic(msg.tcp_listener, self.connection.clone())
-            .into_actor(self)
-            .spawn(ctx);
-        debug!("Forwarding to client {:?}", self.id);
     }
 }
 
@@ -148,24 +96,71 @@ async fn start_local_tcp_server(mode: Mode) -> Result<TcpListener> {
     }
 }
 
-pub async fn start_session(
-    connection_future: Connecting,
-    server_address: Addr<server::StormGrokServer>,
-    key_store_address: Addr<google_key_store::GoogleKeyStore>,
-    auth: settings::AuthRules,
-) {
-    match connection_future.await {
-        Ok(new_conn) => {
-            let conn = new_conn.connection.clone();
-            if let Err(e) = do_handshake(new_conn, server_address, key_store_address, auth).await {
-                error!("Encountered '{:?}' while handshaking client", e);
-                conn.close(1u32.into(), e.to_string().as_bytes())
-            };
+pub async fn start_session(conn: Connecting, client_map: ClientMap, key_map: KeyMap, auth: settings::AuthRules) {
+    info!("Establishing incoming connection");
+    let mut conn: NewConnection = conn.await.unwrap();
+    match do_handshake(&mut conn, key_map, &auth).await {
+        Err(e) => {
+            error!("Encountered '{:?}' while handshaking client", e);
+            conn.connection.close(1u32.into(), e.to_string().as_bytes());
         }
-        Err(e) => error!("Error while instantiating connection to client {:?}", e),
+        Ok((id, tcp_listener)) => {
+            let tcp_addr = tcp_listener.local_addr().unwrap();
+            debug!(
+                "Setting up client session with tcp listener on {:?}",
+                tcp_addr
+            );
+            client_map.write().insert(id, tcp_addr.to_string());
+            let listener = RegisteredListener {
+                tcp_listener,
+                client_map,
+                id,
+            };
+            tokio::select!(
+                _ = connect_tcp_to_bi_quic(listener, conn.connection.clone()) => {},
+                _ = send_ping(conn.connection) => {},
+            );
+        }
     }
 }
 
+async fn do_handshake(new_conn: &mut NewConnection, key_map: KeyMap, auth: &settings::AuthRules) -> Result<(Uuid, TcpListener)> {
+    let id = Uuid::new_v4();
+    info!("assigned {:?}", id);
+    if let Some(Ok((mut send, recv))) = new_conn.bi_streams.next().await {
+        let received_bytes = recv.read_to_end(1000).await?;
+        let requested_mode = Mode::from(received_bytes[0]);
+
+        let tcp_listener = start_local_tcp_server(requested_mode).await?;
+        let tcp_addr = tcp_listener.local_addr()?;
+
+        let token = String::from_utf8_lossy(&received_bytes[1..]);
+        let kid = decode_header(&token)?
+            .kid
+            .ok_or(anyhow!("No kid found in token header"))?;
+
+        let token_message = match key_map.read().get(&kid) {
+            Some(dec_key) => decode::<Claims>(&token, dec_key, &Validation::new(Algorithm::RS256))?,
+            None => bail!("Google did not supply a DecodingKey for 'kid={kid}'"),
+        };
+
+        if let Err(e) = validate_claims(token_message.claims, auth).await {
+            send.reset(1u32.into())?;
+            return Err(e);
+        }
+
+        match requested_mode {
+            Mode::Tcp => send.write_all(&tcp_addr.port().to_be_bytes()).await?,
+            Mode::Http => send.write_all(id.as_bytes()).await?,
+        }
+        send.finish().await?;
+        Ok((id, tcp_listener))
+    } else {
+        bail!("fucked")
+    }
+}
+
+// Claims is a struct that implements Deserialize
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
     hd: Option<String>,
@@ -173,60 +168,7 @@ struct Claims {
     email_verified: bool,
 }
 
-async fn do_handshake(
-    mut new_conn: NewConnection,
-    server_address: Addr<server::StormGrokServer>,
-    key_store_address: Addr<google_key_store::GoogleKeyStore>,
-    auth: settings::AuthRules,
-) -> Result<()> {
-    let conn = new_conn.bi_streams.next().await.ok_or(anyhow!("No conn"))?;
-    let (mut send, recv) = conn?;
-    let received_bytes = recv.read_to_end(1000).await?;
-    let requested_mode = Mode::from(received_bytes[0]);
-
-    let tcp_listener = start_local_tcp_server(requested_mode).await?;
-    let tcp_addr = tcp_listener.local_addr()?;
-    debug!("Reserved: {:?} for new client", &tcp_addr);
-
-    let token = String::from_utf8_lossy(&received_bytes[1..]);
-    let kid = decode_header(&token)?
-        .kid
-        .ok_or(anyhow!("No kid found in token header"))?;
-    let dec_key = google_key_store::get_key_for_kid(key_store_address, kid).await?;
-    let token_message = decode::<Claims>(&token, &dec_key, &Validation::new(Algorithm::RS256))?;
-    validate_claims(token_message.claims, auth).await?;
-
-    let id = Uuid::new_v4();
-
-    let session_address = StormGrokClientSession {
-        id: id,
-        tcp_addr: tcp_addr.to_string(),
-        connection: new_conn.connection,
-        server_address: server_address.clone(),
-    }
-    .start();
-
-    session_address
-        .send(StartListeningOnPort { tcp_listener })
-        .await?;
-
-    server_address
-        .send(server::Connect {
-            id: id,
-            session_data: (session_address.clone(), tcp_addr.to_string()),
-        })
-        .await?;
-
-    match requested_mode {
-        Mode::Tcp => send.write_all(&tcp_addr.port().to_be_bytes()).await?,
-        Mode::Http => send.write_all(id.as_bytes()).await?,
-    }
-    send.finish().await?;
-
-    Ok(())
-}
-
-async fn validate_claims(claims: Claims, auth: settings::AuthRules) -> Result<()> {
+async fn validate_claims(claims: Claims, auth: &settings::AuthRules) -> Result<()> {
     if claims.email_verified && auth.users.contains(&claims.email) {
         return Ok(());
     }
