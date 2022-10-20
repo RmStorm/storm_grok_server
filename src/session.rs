@@ -2,15 +2,15 @@ use futures_util::stream::StreamExt;
 use quinn::{Connecting, Connection, NewConnection};
 use tokio::net::TcpListener;
 
-use anyhow::{Result, bail, anyhow};
-use jsonwebtoken::{decode_header, decode, Algorithm, Validation};
+use anyhow::{anyhow, bail, Result};
+use jsonwebtoken::{decode, decode_header, Algorithm, Validation};
 use serde::{Deserialize, Serialize};
 use std::io::ErrorKind;
 use tokio::time::{self as time, Duration};
 use tracing::log::{debug, error, info};
 use uuid::Uuid;
 
-use crate::{ClientMap, KeyMap, settings};
+use crate::{settings, ClientMap, KeyMap};
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 enum Mode {
@@ -48,8 +48,7 @@ pub struct RegisteredListener {
 
 impl Drop for RegisteredListener {
     fn drop(&mut self) {
-        info!("dropping {:?}", self.tcp_listener);
-        info!("deresigtring from {:?}", self.client_map);
+        info!("de-registering {:?}", &self.id);
         self.client_map.write().remove(&self.id);
     }
 }
@@ -57,7 +56,13 @@ impl Drop for RegisteredListener {
 async fn connect_tcp_to_bi_quic(listener: RegisteredListener, connection: Connection) {
     while let Ok((mut client, addr)) = listener.tcp_listener.accept().await {
         debug!("Created tcp listen port on {:?}", addr);
-        let (mut server_send, mut server_recv) = connection.clone().open_bi().await.unwrap();
+        let (mut server_send, mut server_recv) = match connection.clone().open_bi().await {
+            Ok(res) => res,
+            Err(e) => {
+                error!("Could not establish bi quic conn for forwarding: {e:?}");
+                return;
+            }
+        };
         tokio::spawn(async move {
             let (mut client_recv, mut client_send) = client.split();
             tokio::select! {
@@ -96,68 +101,82 @@ async fn start_local_tcp_server(mode: Mode) -> Result<TcpListener> {
     }
 }
 
-pub async fn start_session(conn: Connecting, client_map: ClientMap, key_map: KeyMap, auth: settings::AuthRules) {
+pub async fn start_session(
+    conn: Connecting,
+    client_map: ClientMap,
+    key_map: KeyMap,
+    auth: settings::AuthRules,
+) {
     info!("Establishing incoming connection");
-    let mut conn: NewConnection = conn.await.unwrap();
-    match do_handshake(&mut conn, key_map, &auth).await {
+    let mut conn: NewConnection = match conn.await {
+        Ok(conn) => conn,
+        Err(e) => {
+            error!("Encountered error while starting quicc conn {e:?}");
+            return;
+        }
+    };
+    let (id, tcp_listener) = match do_handshake(&mut conn, key_map, &auth).await {
+        Ok(res) => res,
         Err(e) => {
             error!("Encountered '{:?}' while handshaking client", e);
             conn.connection.close(1u32.into(), e.to_string().as_bytes());
+            return;
         }
-        Ok((id, tcp_listener)) => {
-            let tcp_addr = tcp_listener.local_addr().unwrap();
-            debug!(
-                "Setting up client session with tcp listener on {:?}",
-                tcp_addr
-            );
-            client_map.write().insert(id, tcp_addr.to_string());
-            let listener = RegisteredListener {
-                tcp_listener,
-                client_map,
-                id,
-            };
-            tokio::select!(
-                _ = connect_tcp_to_bi_quic(listener, conn.connection.clone()) => {},
-                _ = send_ping(conn.connection) => {},
-            );
-        }
-    }
+    };
+
+    let tcp_addr = tcp_listener.local_addr().unwrap();
+    debug!(
+        "Setting up client session with tcp listener on {:?}",
+        tcp_addr
+    );
+    client_map.write().insert(id, tcp_addr.to_string());
+    let listener = RegisteredListener {
+        tcp_listener,
+        client_map,
+        id,
+    };
+    tokio::select!(
+        _ = connect_tcp_to_bi_quic(listener, conn.connection.clone()) => {},
+        _ = send_ping(conn.connection) => {},
+    );
 }
 
-async fn do_handshake(new_conn: &mut NewConnection, key_map: KeyMap, auth: &settings::AuthRules) -> Result<(Uuid, TcpListener)> {
-    let id = Uuid::new_v4();
-    info!("assigned {:?}", id);
-    if let Some(Ok((mut send, recv))) = new_conn.bi_streams.next().await {
-        let received_bytes = recv.read_to_end(1000).await?;
-        let requested_mode = Mode::from(received_bytes[0]);
+async fn do_handshake(
+    new_conn: &mut NewConnection,
+    key_map: KeyMap,
+    auth: &settings::AuthRules,
+) -> Result<(Uuid, TcpListener)> {
+    let conn_err = anyhow!("Could not establish quic connection");
+    let (mut send, recv) = new_conn.bi_streams.next().await.ok_or(conn_err)??;
+    let received_bytes = recv.read_to_end(1000).await?;
+    let requested_mode = Mode::from(received_bytes[0]);
 
-        let tcp_listener = start_local_tcp_server(requested_mode).await?;
-        let tcp_addr = tcp_listener.local_addr()?;
+    let tcp_listener = start_local_tcp_server(requested_mode).await?;
+    let tcp_addr = tcp_listener.local_addr()?;
 
-        let token = String::from_utf8_lossy(&received_bytes[1..]);
-        let kid = decode_header(&token)?
-            .kid
-            .ok_or(anyhow!("No kid found in token header"))?;
+    let token = String::from_utf8_lossy(&received_bytes[1..]);
+    let kid = decode_header(&token)?
+        .kid
+        .ok_or(anyhow!("No kid found in token header"))?;
 
-        let token_message = match key_map.read().get(&kid) {
-            Some(dec_key) => decode::<Claims>(&token, dec_key, &Validation::new(Algorithm::RS256))?,
-            None => bail!("Google did not supply a DecodingKey for 'kid={kid}'"),
-        };
+    let token_message = match key_map.read().get(&kid) {
+        Some(dec_key) => decode::<Claims>(&token, dec_key, &Validation::new(Algorithm::RS256))?,
+        None => bail!("Google did not supply a DecodingKey for 'kid={kid}'"), // todo: try fetching new keys before bailing
+    };
 
-        if let Err(e) = validate_claims(token_message.claims, auth).await {
-            send.reset(1u32.into())?;
-            return Err(e);
-        }
-
-        match requested_mode {
-            Mode::Tcp => send.write_all(&tcp_addr.port().to_be_bytes()).await?,
-            Mode::Http => send.write_all(id.as_bytes()).await?,
-        }
-        send.finish().await?;
-        Ok((id, tcp_listener))
-    } else {
-        bail!("fucked")
+    if let Err(e) = validate_claims(token_message.claims, auth).await {
+        send.reset(1u32.into())?;
+        return Err(e);
     }
+
+    let id = Uuid::new_v4();
+    info!("Succesfully connected new quic client with {id:?}");
+    match requested_mode {
+        Mode::Tcp => send.write_all(&tcp_addr.port().to_be_bytes()).await?,
+        Mode::Http => send.write_all(id.as_bytes()).await?,
+    }
+    send.finish().await?;
+    Ok((id, tcp_listener))
 }
 
 // Claims is a struct that implements Deserialize

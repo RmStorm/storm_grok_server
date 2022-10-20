@@ -1,5 +1,5 @@
 use crate::{HttpsClient, KeyMap};
-use anyhow::{Result, Context, anyhow};
+use anyhow::{anyhow, Context, Result};
 use hyper::Uri;
 use jsonwebtoken::DecodingKey;
 use regex::Regex;
@@ -34,13 +34,12 @@ pub async fn refresh_loop(key_store: KeyMap, https_client: HttpsClient) {
                 }
                 info!("Refreshed tokens, refreshing again in {:?}", max_age);
                 sleep(max_age).await;
-            },
+            }
             Err(e) => {
                 error!("Encountered error while refreshing keys '{:?}'", e);
                 sleep(Duration::from_millis(10000)).await;
-            },
+            }
         }
-        
     }
 }
 
@@ -60,8 +59,8 @@ async fn refresh_token(
         .context("Could not find cache control header")?
         .clone();
 
-    let ser = hyper::body::to_bytes(res).await.unwrap();
-    let kd: KeyData = serde_json::from_slice(&ser).unwrap();
+    let ser = hyper::body::to_bytes(res).await?;
+    let kd: KeyData = serde_json::from_slice(&ser)?;
 
     let re = Regex::new(r"max-age=(\d*),")?;
     let cap = re
