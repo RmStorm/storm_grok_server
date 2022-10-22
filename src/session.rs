@@ -148,25 +148,28 @@ async fn do_handshake(
 ) -> Result<(Uuid, TcpListener)> {
     let conn_err = anyhow!("Could not establish quic connection");
     let (mut send, recv) = new_conn.bi_streams.next().await.ok_or(conn_err)??;
-    let received_bytes = recv.read_to_end(1000).await?;
+    // Since JWT's have to fit in a header 8kb is the practical upper limit on token size
+    let received_bytes = recv.read_to_end(8192).await?;
     let requested_mode = Mode::from(received_bytes[0]);
 
     let tcp_listener = start_local_tcp_server(requested_mode).await?;
     let tcp_addr = tcp_listener.local_addr()?;
 
-    let token = String::from_utf8_lossy(&received_bytes[1..]);
-    let kid = decode_header(&token)?
-        .kid
-        .ok_or(anyhow!("No kid found in token header"))?;
+    if auth.enabled {
+        let token = String::from_utf8_lossy(&received_bytes[1..]);
+        let kid = decode_header(&token)?
+            .kid
+            .ok_or(anyhow!("No kid found in token header"))?;
 
-    let token_message = match key_map.read().get(&kid) {
-        Some(dec_key) => decode::<Claims>(&token, dec_key, &Validation::new(Algorithm::RS256))?,
-        None => bail!("Google did not supply a DecodingKey for 'kid={kid}'"), // todo: try fetching new keys before bailing
-    };
+        let token_message = match key_map.read().get(&kid) {
+            Some(dec_key) => decode::<Claims>(&token, dec_key, &Validation::new(Algorithm::RS256))?,
+            None => bail!("Google did not supply a DecodingKey for 'kid={kid}'"), // todo: try fetching new keys before bailing
+        };
 
-    if let Err(e) = validate_claims(token_message.claims, auth).await {
-        send.reset(1u32.into())?;
-        return Err(e);
+        if let Err(e) = validate_claims(token_message.claims, auth).await {
+            send.reset(1u32.into())?;
+            return Err(e);
+        }
     }
 
     let id = Uuid::new_v4();

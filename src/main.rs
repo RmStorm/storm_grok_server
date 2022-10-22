@@ -6,7 +6,7 @@ use std::{
 
 use jsonwebtoken::DecodingKey;
 use parking_lot::RwLock;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use hyper::client::HttpConnector;
@@ -108,6 +108,10 @@ async fn main() {
     let addr = format!("{}:{}", config.server.http_host, config.server.http_port);
     info!("starting storm grok server at {}", addr);
     let addr: SocketAddr = addr.parse().unwrap();
+    match config.auth.enabled {
+        true => info!("Running with authentication enabled on client connections, rules are: {:?}", config.auth),
+        false => warn!("RUNNING WITHOUT AUTHENTICATION!! Anyone can use your instance to tunnel any traffic!"),
+    }
 
     if config.env == settings::ENV::Prod {
         let (certs, key) = config.get_certs_and_key();

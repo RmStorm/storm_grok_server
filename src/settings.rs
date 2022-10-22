@@ -30,6 +30,7 @@ pub struct Server {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct AuthRules {
+    pub enabled: bool,
     pub users: Vec<String>,
     pub host_domains: Vec<String>,
 }

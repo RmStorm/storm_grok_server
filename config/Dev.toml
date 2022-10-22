@@ -6,3 +6,6 @@ quic_host = "127.0.0.1"
 [log]
 level = "debug"
 format = "pretty"
+
+[auth]
+enabled = false
