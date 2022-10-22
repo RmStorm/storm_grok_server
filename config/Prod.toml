@@ -1,6 +1,7 @@
 [server]
 http_port = "443"
-host = "0.0.0.0"
+http_host = "[::]"
+quic_host = "0.0.0.0"
 
 [log]
 level = "info"

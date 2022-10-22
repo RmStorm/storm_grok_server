@@ -24,7 +24,7 @@ pub async fn start_storm_grok_server(
     client_map: ClientMap,
     key_map: KeyMap,
 ) -> Result<()> {
-    let server_address = format!("{}:{:?}", config.server.host, config.server.quic_port);
+    let server_address = format!("{}:{:?}", config.server.quic_host, config.server.quic_port);
     let server_address = server_address.parse::<SocketAddr>().unwrap();
 
     let (certs, key) = config.get_certs_and_key();

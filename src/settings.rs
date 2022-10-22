@@ -21,7 +21,8 @@ pub struct Tls {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Server {
-    pub host: String,
+    pub http_host: String,
+    pub quic_host: String,
     pub http_port: u16,
     pub quic_port: u16,
     pub tls: Option<Tls>,

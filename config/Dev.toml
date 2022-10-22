@@ -1,6 +1,7 @@
 [server]
 http_port = "3000"
-host = "127.0.0.1"
+http_host = "[::1]"
+quic_host = "127.0.0.1"
 
 [log]
 level = "debug"

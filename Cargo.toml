@@ -6,6 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+hyper-reverse-proxy = { git = "https://github.com/felipenoris/hyper-reverse-proxy", rev = "e73a76600ce9e51e962de5266b03be596e6c1d50" }
 axum = "0.5"
 axum-server = { version = "0.4.2", features = ["tls-rustls"] }
 tokio = { version = "1", features = ["full"] }

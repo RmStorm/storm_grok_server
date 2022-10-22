@@ -1,26 +1,29 @@
-use axum::body::Body;
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::Arc,
+};
+
+use jsonwebtoken::DecodingKey;
+use parking_lot::RwLock;
+use tracing::info;
+use uuid::Uuid;
+
 use hyper::client::HttpConnector;
 use hyper_rustls::HttpsConnector;
 use rustls::ServerConfig;
 
-use axum::response::Response;
-
-use axum::http::status::StatusCode;
-use axum::{http::Request, routing::any};
-use axum_server::tls_rustls::RustlsConfig;
-use hyper::Uri;
 use tower::util::ServiceExt;
 
-use axum::Extension;
-use tracing::info;
-use uuid::Uuid;
-
-use axum::{extract::Host, Router};
-use jsonwebtoken::DecodingKey;
-use parking_lot::RwLock;
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use axum::{
+    body::Body,
+    extract::{ConnectInfo, Host},
+    http::{status::StatusCode, Request},
+    response::Response,
+    routing::any,
+    Extension, Router,
+};
+use axum_server::tls_rustls::RustlsConfig;
 
 mod google_key_store;
 mod server;
@@ -35,19 +38,13 @@ type HttpsClient = hyper::client::Client<HttpsConnector<HttpConnector>, Body>;
 async fn forwarder(
     Extension(client): Extension<HttpClient>,
     Extension(client_map): Extension<ClientMap>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     host: Host,
-    mut req: Request<Body>,
+    req: Request<Body>,
 ) -> Response<Body> {
-    let path_query = req
-        .uri()
-        .path_and_query()
-        .map(|v| v.as_str())
-        .unwrap_or(req.uri().path());
-
     let uuid = resolve_uuid_from_host(&host.0).unwrap();
-
-    let uri = match client_map.read().get(&uuid) {
-        Some(addr) => format!("http://{}{}", addr, path_query),
+    let target = match client_map.read().get(&uuid) {
+        Some(target) => format!("http://{}", target),
         None => {
             return Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -55,9 +52,13 @@ async fn forwarder(
                 .unwrap();
         }
     };
-
-    *req.uri_mut() = Uri::try_from(uri).unwrap();
-    client.request(req).await.unwrap()
+    match hyper_reverse_proxy::call(addr.ip(), &target, req, &client).await {
+        Ok(response) => response,
+        Err(_error) => Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::empty())
+            .unwrap(),
+    }
 }
 
 async fn handler(Extension(client_map): Extension<ClientMap>, host: Host) -> &'static str {
@@ -79,7 +80,7 @@ async fn main() {
     let client_map: ClientMap = Arc::new(RwLock::new(HashMap::new()));
     let sg_server = server::start_storm_grok_server(&config, client_map.clone(), key_store.clone());
 
-    let client: HttpClient = hyper::Client::new();
+    let http_client: HttpClient = hyper::Client::new();
 
     let https = hyper_rustls::HttpsConnectorBuilder::new()
         .with_native_roots()
@@ -102,9 +103,9 @@ async fn main() {
             }),
         )
         .layer(Extension(client_map))
-        .layer(Extension(client));
+        .layer(Extension(http_client));
 
-    let addr = format!("{}:{}", config.server.host, config.server.http_port);
+    let addr = format!("{}:{}", config.server.http_host, config.server.http_port);
     info!("starting storm grok server at {}", addr);
     let addr: SocketAddr = addr.parse().unwrap();
 
@@ -117,14 +118,16 @@ async fn main() {
                 .with_single_cert(certs, key)
                 .expect("bad certificate/key"),
         ));
-        let http_serve = axum_server::bind_rustls(addr, tls_config).serve(app.into_make_service());
+        let http_serve = axum_server::bind_rustls(addr, tls_config)
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>());
         tokio::select!(
             _ = http_serve => {},
             _ = sg_server => {},
             _ = google_key_store::refresh_loop(key_store, https_client) => {},
         );
     } else {
-        let http_serve = axum_server::bind(addr).serve(app.into_make_service());
+        let http_serve =
+            axum_server::bind(addr).serve(app.into_make_service_with_connect_info::<SocketAddr>());
         tokio::select!(
             _ = http_serve => {},
             _ = sg_server => {},
